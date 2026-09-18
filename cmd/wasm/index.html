@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>UQM Planet Generator</title>
+<style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif;
+        background-color: #1a1a2e;
+        color: #eee;
+        min-height: 100vh;
+        padding: 20px;
+    }
+    h1 { text-align: center; margin-bottom: 30px; color: #4cc9f0; }
+    .container { display: flex; gap: 20px; max-width: 1200px; margin: 0 auto; flex-wrap: wrap; }
+    .controls { flex: 1; min-width: 300px; background: #16213e; border-radius: 10px; padding: 20px; }
+    .canvas-container {
+        flex: 2; min-width: 400px;
+        background: #16213e; border-radius: 10px; padding: 20px;
+        display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 12px;
+    }
+    .form-group { margin-bottom: 15px; }
+    label { display: block; margin-bottom: 5px; font-weight: 600; color: #4cc9f0; }
+    input, select {
+        width: 100%; padding: 10px; border-radius: 5px;
+        border: none; background: #0f3460; color: #eee;
+    }
+    button {
+        width: 100%; padding: 12px; border: none; border-radius: 5px;
+        background: linear-gradient(45deg, #e94560, #c70039); color: white; font-size: 16px; cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: default; }
+    canvas {
+        width: 100%; height: auto; border-radius: 5px; background: #0f3460;
+        image-rendering: pixelated;
+    }
+    #status { min-height: 1.2em; font-size: 14px; color: #9aa5c4; text-align: center; }
+    #status.error { color: #ff6b81; }
+</style>
+</head>
+<body>
+<h1>Planet Generator</h1>
+<div class="container">
+    <div class="controls">
+        <div class="form-group">
+            <label for="preset">Preset Planet</label>
+            <select id="preset"><option value="">(loading…)</option></select>
+        </div>
+        <div class="form-group">
+            <label for="name">Planet Name</label>
+            <input type="text" id="name" value="PLANET">
+        </div>
+        <div class="form-group">
+            <label for="seed">Seed</label>
+            <input type="number" id="seed" value="12345" min="0" step="1">
+        </div>
+        <div class="form-group">
+            <label for="algorithm">Algorithm</label>
+            <select id="algorithm">
+                <option value="0">Topography (Faults)</option>
+                <option value="1" selected>Cratered</option>
+                <option value="2">Gas Giant</option>
+            </select>
+        </div>
+        <div class="form-group">
+            <label for="numFaults">Number of Faults (bands, for a gas giant)</label>
+            <input type="number" id="numFaults" value="10" min="0" step="1">
+        </div>
+        <div class="form-group">
+            <label for="faultDepth">Fault Depth</label>
+            <input type="number" id="faultDepth" value="50" step="1">
+        </div>
+        <div class="form-group">
+            <label for="blemishes">Blemishes</label>
+            <input type="number" id="blemishes" value="20" min="0" step="1">
+        </div>
+        <div class="form-group">
+            <label for="elevation">Base Elevation</label>
+            <input type="number" id="elevation" value="100" step="1">
+        </div>
+        <button id="generateBtn" disabled>Generate Planet</button>
+    </div>
+    <div class="canvas-container">
+        <canvas id="planetCanvas" width="242" height="75"></canvas>
+        <div id="status">Loading WebAssembly module…</div>
+    </div>
+</div>
+
+<script src="wasm_exec.js"></script>
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status");
+
+function setStatus(text, isError) {
+    statusEl.textContent = text;
+    statusEl.classList.toggle("error", Boolean(isError));
+}
+
+// The module calls this once its functions are installed, so nothing here has
+// to poll for them.
+globalThis.onPlanetGeneratorReady = () => {
+    populatePresets();
+    wireUpControls();
+    pushParameters();
+    $("generateBtn").disabled = false;
+    setStatus("Ready.");
+    generate();
+};
+
+// The import object and the instance that runs must come from the same Go.
+const go = new Go();
+
+WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject)
+    .then((result) => go.run(result.instance))
+    .catch((err) => setStatus("Could not load main.wasm: " + err.message, true));
+
+function populatePresets() {
+    const select = $("preset");
+    select.innerHTML = "";
+    select.appendChild(new Option("(custom)", ""));
+    for (const name of getPresetNames().split(",")) {
+        if (name) select.appendChild(new Option(name, name));
+    }
+}
+
+function wireUpControls() {
+    for (const id of ["name", "seed", "algorithm", "numFaults", "faultDepth", "blemishes", "elevation"]) {
+        $(id).addEventListener("change", () => { pushParameters(); generate(); });
+    }
+    $("preset").addEventListener("change", onPresetChanged);
+    $("generateBtn").addEventListener("click", generate);
+}
+
+// number returns a form field as a number, or null when it is blank so that a
+// half-typed field leaves the current value alone.
+function number(id) {
+    const raw = $(id).value.trim();
+    if (raw === "") return null;
+    const v = Number(raw);
+    return Number.isFinite(v) ? v : null;
+}
+
+function pushParameters() {
+    const algo = number("algorithm") ?? 1;
+    setPlanetName($("name").value);
+    setPlanetAlgo(algo);
+    // The colour path is a separate flag from the algorithm; the form ties the
+    // two together.
+    setPlanetGasGiant(algo === 2 ? 1 : 0);
+
+    const fields = {
+        seed: setPlanetSeed,
+        numFaults: setPlanetNumFaults,
+        faultDepth: setPlanetFaultDepth,
+        blemishes: setPlanetNumBlemishes,
+        elevation: setPlanetBaseElevation,
+    };
+    for (const [id, set] of Object.entries(fields)) {
+        const v = number(id);
+        if (v !== null) set(v);
+    }
+}
+
+function onPresetChanged() {
+    const name = $("preset").value;
+    if (!name) return;
+    const err = setPresetPlanet(name);
+    if (typeof err === "string") { setStatus(err, true); return; }
+    pullParameters();
+    generate();
+}
+
+function pullParameters() {
+    let params;
+    try {
+        params = JSON.parse(getCurrentParamsJSON());
+    } catch (err) {
+        setStatus("Could not read parameters: " + err.message, true);
+        return;
+    }
+    $("name").value = params.name;
+    $("seed").value = params.seed;
+    $("algorithm").value = params.algo;
+    $("numFaults").value = params.numFaults;
+    $("faultDepth").value = params.faultDepth;
+    $("blemishes").value = params.numBlemishes;
+    $("elevation").value = params.baseElevation;
+}
+
+function generate() {
+    const result = renderWithParams();
+    if (typeof result !== "string" || result.startsWith("error")) {
+        setStatus(String(result), true);
+        return;
+    }
+    const canvas = $("planetCanvas");
+    const ctx = canvas.getContext("2d");
+    const img = new Image();
+    img.onload = () => {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0);
+        setStatus("Rendered " + canvas.width + "\u00d7" + canvas.height + ".");
+    };
+    img.onerror = () => setStatus("Could not decode the rendered image.", true);
+    img.src = "data:image/png;base64," + result;
+}
+</script>
+</body>
+</html>
